@@ -1,3 +1,6 @@
+## New mode for Anvil
+Check NO_MINING_EXECUTE_FEATURE.md(./NO_MINING_EXECUTE_FEATURE.md) for details
+
 <div align="center">
   <img src=".github/assets/banner.png" alt="Foundry banner" />
 

@@ -1114,7 +1114,7 @@ impl EthApi {
         let provides = vec![to_marker(nonce, from)];
         debug_assert!(requires != provides);
 
-        self.add_pending_transaction(pending_transaction, requires, provides)
+        self.add_pending_transaction(pending_transaction, requires, provides).await
     }
 
     /// Waits for a transaction to be included in a block and returns its receipt (no timeout).
@@ -1197,8 +1197,20 @@ impl EthApi {
             priority,
         };
 
-        let tx = self.pool.add_transaction(pool_transaction)?;
+        let tx = self.pool.add_transaction(pool_transaction.clone())?;
         trace!(target: "node", "Added transaction: [{:?}] sender={:?}", tx.hash(), from);
+
+        // If no-mining-execute mode is enabled, execute the transaction immediately
+        let config = self.backend.node_config().await;
+        if config.no_mining && config.no_mining_execute {
+            trace!(target: "node", "Executing transaction immediately without mining: [{:?}]", tx.hash());
+            self.backend.execute_transaction_without_mining(Arc::new(pool_transaction.clone())).await?;
+
+            // Remove the transaction from the pool since it's already been executed
+            // This prevents it from being mined again if evm_mine is called
+            self.pool.drop_transaction(*tx.hash());
+        }
+
         Ok(*tx.hash())
     }
 
@@ -2851,7 +2863,7 @@ impl EthApi {
         let requires = required_marker(nonce, on_chain_nonce, from);
         let provides = vec![to_marker(nonce, from)];
 
-        self.add_pending_transaction(pending_transaction, requires, provides)
+        self.add_pending_transaction(pending_transaction, requires, provides).await
     }
 
     /// Returns the number of transactions currently pending for inclusion in the next block(s), as
@@ -3481,7 +3493,7 @@ impl EthApi {
     }
 
     /// Adds the given transaction to the pool
-    fn add_pending_transaction(
+    async fn add_pending_transaction(
         &self,
         pending_transaction: PendingTransaction,
         requires: Vec<TxMarker>,
@@ -3491,8 +3503,20 @@ impl EthApi {
         let priority = self.transaction_priority(&pending_transaction.transaction);
         let pool_transaction =
             PoolTransaction { requires, provides, pending_transaction, priority };
-        let tx = self.pool.add_transaction(pool_transaction)?;
+        let tx = self.pool.add_transaction(pool_transaction.clone())?;
         trace!(target: "node", "Added transaction: [{:?}] sender={:?}", tx.hash(), from);
+
+        // If no-mining-execute mode is enabled, execute the transaction immediately
+        let config = self.backend.node_config().await;
+        if config.no_mining && config.no_mining_execute {
+            trace!(target: "node", "Executing transaction immediately without mining: [{:?}]", tx.hash());
+            self.backend.execute_transaction_without_mining(Arc::new(pool_transaction.clone())).await?;
+
+            // Remove the transaction from the pool since it's already been executed
+            // This prevents it from being mined again if evm_mine is called
+            self.pool.drop_transaction(*tx.hash());
+        }
+
         Ok(*tx.hash())
     }
 

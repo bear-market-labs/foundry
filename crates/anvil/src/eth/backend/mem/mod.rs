@@ -84,7 +84,7 @@ use alloy_signer::Signature;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_trie::{HashBuilder, Nibbles, proof::ProofRetainer};
 use anvil_core::eth::{
-    block::{Block, BlockInfo},
+    block::{Block, BlockInfo, create_block},
     transaction::{
         MaybeImpersonatedTransaction, PendingTransaction, ReceiptResponse, TransactionInfo,
         TypedReceipt, TypedReceiptRpc, TypedTransaction, has_optimism_fields,
@@ -244,6 +244,8 @@ pub struct Backend {
     precompile_factory: Option<Arc<dyn PrecompileFactory>>,
     /// Prevent race conditions during mining
     mining: Arc<tokio::sync::Mutex<()>>,
+    /// Pending virtual blocks created in no-mining-execute mode that should be finalized on next evm_mine
+    pending_virtual_blocks: Arc<Mutex<Vec<B256>>>,
     // === wallet === //
     capabilities: Arc<RwLock<WalletCapabilities>>,
     executor_wallet: Arc<RwLock<Option<EthereumWallet>>>,
@@ -345,6 +347,7 @@ impl Backend {
             slots_in_an_epoch,
             precompile_factory,
             mining: Arc::new(tokio::sync::Mutex::new(())),
+            pending_virtual_blocks: Arc::new(Mutex::new(Vec::new())),
             capabilities: Arc::new(RwLock::new(WalletCapabilities(Default::default()))),
             executor_wallet: Arc::new(RwLock::new(None)),
             disable_pool_balance_checks,
@@ -894,6 +897,11 @@ impl Backend {
         Err(BlockchainError::EIP7702TransactionUnsupportedAtHardfork)
     }
 
+    /// Returns the node configuration
+    pub async fn node_config(&self) -> NodeConfig {
+        self.node_config.read().await.clone()
+    }
+
     /// Returns an error if op-stack deposits are not active
     pub fn ensure_op_deposits_active(&self) -> Result<(), BlockchainError> {
         if self.is_optimism() {
@@ -1319,6 +1327,22 @@ impl Backend {
         pool_transactions: Vec<Arc<PoolTransaction>>,
     ) -> MinedBlockOutcome {
         let _mining_guard = self.mining.lock().await;
+
+        // Check if we should finalize pending virtual blocks instead of creating a new one
+        let pending_virtual_blocks = if pool_transactions.is_empty() {
+            let mut blocks = self.pending_virtual_blocks.lock();
+            let all_blocks = blocks.drain(..).collect::<Vec<_>>();
+            drop(blocks);
+            all_blocks
+        } else {
+            Vec::new()
+        };
+
+        if !pending_virtual_blocks.is_empty() {
+            // Finalize all virtual blocks into a single block
+            return self.finalize_virtual_blocks(pending_virtual_blocks).await;
+        }
+
         trace!(target: "backend", "creating new block with {} transactions", pool_transactions.len());
 
         let (outcome, header, block_hash) = {
@@ -1497,6 +1521,246 @@ impl Backend {
 
         outcome
     }
+
+    /// Executes a single transaction immediately without mining a block.
+    /// This updates the state but doesn't create a new block.
+    /// Used in no-mining-execute mode.
+    pub async fn execute_transaction_without_mining(
+        &self,
+        pool_transaction: Arc<PoolTransaction>,
+    ) -> Result<(), BlockchainError> {
+        let _mining_guard = self.mining.lock().await;
+        trace!(target: "backend", "executing transaction without mining: {:?}", pool_transaction.hash());
+
+        // Execute at the next block number (best_number + 1), similar to regular mining
+        let (best_hash, block_number) = {
+            let storage = self.blockchain.storage.read();
+            (storage.best_hash, storage.best_number.saturating_add(1))
+        };
+
+        // Execute the transaction within the db lock scope
+        let executed_tx = {
+            let mut env = self.env.read().clone();
+
+            if env.evm_env.block_env.basefee == 0 {
+                env.evm_env.cfg_env.disable_base_fee = true;
+            }
+
+            // Update block number and timestamp for this execution
+            env.evm_env.block_env.number = U256::from(block_number);
+            env.evm_env.block_env.timestamp = U256::from(self.time.current_call_timestamp());
+
+            let mut db = self.db.write().await;
+
+            let executor = TransactionExecutor {
+                db: &mut **db,
+                validator: self,
+                pending: vec![pool_transaction.clone()].into_iter(),
+                block_env: env.evm_env.block_env.clone(),
+                cfg_env: env.evm_env.cfg_env.clone(),
+                parent_hash: best_hash,
+                gas_used: 0,
+                blob_gas_used: 0,
+                enable_steps_tracing: self.enable_steps_tracing,
+                print_logs: self.print_logs,
+                print_traces: self.print_traces,
+                call_trace_decoder: self.call_trace_decoder.clone(),
+                networks: self.env.read().networks,
+                precompile_factory: self.precompile_factory.clone(),
+                blob_params: self.blob_params(),
+                cheats: self.cheats().clone(),
+            };
+
+            executor.execute()
+        };
+
+        // Store the transaction receipt so it can be queried
+        if let Some(tx_info) = executed_tx.block.transactions.first() {
+            node_info!("Transaction executed without mining: {:?}", tx_info.transaction_hash);
+            if let Some(contract) = &tx_info.contract_address {
+                node_info!("    Contract created: {contract}");
+            }
+            if !tx_info.exit.is_ok() {
+                let r = RevertDecoder::new().decode(
+                    tx_info.out.as_ref().map(|b| &b[..]).unwrap_or_default(),
+                    Some(tx_info.exit),
+                );
+                node_info!("    Error: reverted with: {r}");
+            }
+
+            // Create a MinedTransaction entry so the receipt can be queried
+            // even though no block was mined
+            if let Some(receipt) = executed_tx.block.receipts.first().cloned() {
+                // Create a virtual block hash for this transaction
+                // We use a hash derived from the transaction hash to make it unique
+                let virtual_block_hash = keccak256(
+                    [b"no-mining-execute:", tx_info.transaction_hash.as_slice()].concat()
+                );
+
+                let mined_tx = MinedTransaction {
+                    info: tx_info.clone(),
+                    receipt,
+                    block_hash: virtual_block_hash,
+                    block_number,
+                };
+
+                // Store the virtual block containing just this transaction
+                // This allows mined_transaction_receipt to find the transaction
+                let mut storage = self.blockchain.storage.write();
+                storage.transactions.insert(tx_info.transaction_hash, mined_tx);
+
+                // Store a virtual block with just this transaction so receipt lookup works
+                if let Some(tx) = executed_tx.block.block.body.transactions.first() {
+                    // Try to get current block from storage first, then from env
+                    let current_block = storage.blocks.get(&best_hash).cloned();
+                    let mut virtual_header = if let Some(current_block) = current_block {
+                        // Use the current block's header as a template
+                        let mut header = current_block.header.clone();
+                        header.transactions_root = executed_tx.block.block.header.transactions_root;
+                        header
+                    } else {
+                        // In fork mode, the current block might not be in storage
+                        // Use the header from the executed transaction's block
+                        executed_tx.block.block.header.clone()
+                    };
+
+                    // Update the block number to match the execution block number
+                    virtual_header.number = block_number;
+
+                    let virtual_block = create_block(virtual_header, vec![tx.clone()]);
+                    storage.blocks.insert(virtual_block_hash, virtual_block);
+                    node_info!("    Virtual block created: {:?}", virtual_block_hash);
+
+                    // Track this virtual block so evm_mine can finalize it
+                    drop(storage); // Release the write lock before acquiring the mutex
+                    self.pending_virtual_blocks.lock().push(virtual_block_hash);
+                } else {
+                    node_info!("    Warning: No transaction in executed block");
+                }
+            }
+        }
+
+        // Note: We don't create a block, but the state changes are committed to the database
+        // The transaction is executed and state is updated, but no block is mined
+
+        Ok(())
+    }
+
+    /// Finalizes multiple virtual blocks into a single block
+    /// This is called when evm_mine is invoked and there are pending virtual blocks
+    async fn finalize_virtual_blocks(&self, virtual_block_hashes: Vec<B256>) -> MinedBlockOutcome {
+        node_info!("Finalizing {} virtual blocks into one block", virtual_block_hashes.len());
+
+        let (outcome, header, block_hash, tx_count) = {
+            let mut storage = self.blockchain.storage.write();
+
+            // Collect all transactions from all virtual blocks
+            let mut all_transactions = Vec::new();
+            let mut all_tx_hashes = Vec::new();
+            let mut block_number = 0u64;
+            let mut base_header = None;
+
+            for virtual_block_hash in &virtual_block_hashes {
+                let virtual_block = storage.blocks.get(virtual_block_hash).cloned()
+                    .expect("Virtual block should exist");
+
+                // Use the first virtual block's header as the base
+                if base_header.is_none() {
+                    base_header = Some(virtual_block.header.clone());
+                    block_number = virtual_block.header.number;
+                }
+
+                // Collect all transactions
+                for tx in &virtual_block.body.transactions {
+                    all_transactions.push(tx.clone());
+                    all_tx_hashes.push(tx.hash());
+                }
+            }
+
+            let tx_count = all_transactions.len();
+            let mut new_header = base_header.expect("Should have at least one virtual block");
+
+            // Use next_timestamp() to get the timestamp for the finalized block
+            // This consumes evm_setNextBlockTimestamp and applies evm_increaseTime offsets
+            new_header.timestamp = self.time.next_timestamp();
+
+            // Create the finalized block with all transactions
+            let new_block = create_block(new_header.clone(), all_transactions.clone());
+            let new_block_hash = new_header.hash_slow();
+
+            // Update all mined transactions to point to the new finalized block
+            for tx_hash in &all_tx_hashes {
+                if let Some(mined_tx) = storage.transactions.get(tx_hash).cloned() {
+                    let updated_mined_tx = MinedTransaction {
+                        info: mined_tx.info.clone(),
+                        receipt: mined_tx.receipt.clone(),
+                        block_hash: new_block_hash,
+                        block_number,
+                    };
+                    storage.transactions.insert(*tx_hash, updated_mined_tx);
+                }
+            }
+
+            // Remove all old virtual blocks
+            for virtual_block_hash in &virtual_block_hashes {
+                storage.blocks.remove(virtual_block_hash);
+            }
+
+            // Store the new finalized block
+            storage.blocks.insert(new_block_hash, new_block);
+            storage.hashes.insert(block_number, new_block_hash);
+
+            // Update best block to the finalized block
+            storage.best_hash = new_block_hash;
+            storage.best_number = block_number;
+
+            let outcome = MinedBlockOutcome {
+                block_number,
+                included: vec![],
+                invalid: vec![],
+            };
+
+            (outcome, new_header, new_block_hash, tx_count)
+        };
+
+        // Update environment's block number to match the finalized block
+        // This ensures that subsequent RPC calls use the correct block number
+        {
+            let mut env = self.env.write();
+            env.evm_env.block_env.number = U256::from(header.number);
+        }
+
+        // Note: last_timestamp was already updated by next_timestamp() call above
+        // No need to call set_last_timestamp() here
+
+        // Update fees for next block
+        let next_block_base_fee = self.fees.get_next_block_base_fee_per_gas(
+            header.gas_used,
+            header.gas_limit,
+            header.base_fee_per_gas.unwrap_or_default(),
+        );
+        let next_block_excess_blob_gas = self.fees.get_next_block_blob_excess_gas(
+            header.excess_blob_gas.unwrap_or_default(),
+            header.blob_gas_used.unwrap_or_default(),
+        );
+
+        self.fees.set_base_fee(next_block_base_fee);
+        self.fees.set_blob_excess_gas_and_price(BlobExcessGasAndPrice::new(
+            next_block_excess_blob_gas,
+            get_blob_base_fee_update_fraction_by_spec_id(*self.env.read().evm_env.spec_id()),
+        ));
+
+        // Notify listeners
+        self.notify_on_new_block(header, block_hash);
+
+        node_info!("    Block Number: {}", outcome.block_number);
+        node_info!("    Block Hash: {:?}", block_hash);
+        node_info!("    Finalized {} transactions into one block\n", tx_count);
+
+        outcome
+    }
+
+
 
     /// Executes the [TransactionRequest] without writing to the DB
     ///

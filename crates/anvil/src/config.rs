@@ -129,6 +129,8 @@ pub struct NodeConfig {
     pub block_time: Option<Duration>,
     /// Disable auto, interval mining mode uns use `MiningMode::None` instead
     pub no_mining: bool,
+    /// Execute transactions immediately without mining blocks when in no-mining mode
+    pub no_mining_execute: bool,
     /// Enables auto and interval mining mode
     pub mixed_mining: bool,
     /// port to use for the server
@@ -457,6 +459,7 @@ impl Default for NodeConfig {
             genesis_balance: Unit::ETHER.wei().saturating_mul(U256::from(100u64)),
             block_time: None,
             no_mining: false,
+            no_mining_execute: false,
             mixed_mining: false,
             port: NODE_PORT,
             max_transactions: 1_000,
@@ -783,6 +786,13 @@ impl NodeConfig {
     #[must_use]
     pub fn with_no_mining(mut self, no_mining: bool) -> Self {
         self.no_mining = no_mining;
+        self
+    }
+
+    /// If set to `true` transactions will be executed immediately without mining blocks in no-mining mode
+    #[must_use]
+    pub fn with_no_mining_execute(mut self, no_mining_execute: bool) -> Self {
+        self.no_mining_execute = no_mining_execute;
         self
     }
 

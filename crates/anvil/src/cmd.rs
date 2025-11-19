@@ -100,6 +100,11 @@ pub struct NodeArgs {
     #[arg(long, visible_alias = "no-mine", conflicts_with = "block_time")]
     pub no_mining: bool,
 
+    /// Execute transactions immediately without mining blocks when in no-mining mode.
+    /// This allows transactions to update state without creating new blocks.
+    #[arg(long, visible_alias = "no-mining-execute", requires = "no_mining")]
+    pub no_mining_execute: bool,
+
     #[arg(long, visible_alias = "mixed-mining", requires = "block_time")]
     pub mixed_mining: bool,
 
@@ -234,6 +239,7 @@ impl NodeArgs {
             .with_hardfork(hardfork)
             .with_blocktime(self.block_time)
             .with_no_mining(self.no_mining)
+            .with_no_mining_execute(self.no_mining_execute)
             .with_mixed_mining(self.mixed_mining, self.block_time)
             .with_account_generator(self.account_generator())?
             .with_genesis_balance(genesis_balance)

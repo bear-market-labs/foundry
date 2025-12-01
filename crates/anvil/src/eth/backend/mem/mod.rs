@@ -2685,6 +2685,12 @@ impl Backend {
         block_id: Option<T>,
     ) -> Result<u64, BlockchainError> {
         let current = self.best_number();
+
+        // In no-mining-execute mode, if there are pending virtual blocks,
+        // the effective current block is best_number + 1 (where virtual blocks are executing)
+        let has_virtual_blocks = !self.pending_virtual_blocks.lock().is_empty();
+        let effective_current = if has_virtual_blocks { current.saturating_add(1) } else { current };
+
         let requested =
             match block_id.map(Into::into).unwrap_or(BlockId::Number(BlockNumber::Latest)) {
                 BlockId::Hash(hash) => {
@@ -2695,16 +2701,16 @@ impl Backend {
                         .number
                 }
                 BlockId::Number(num) => match num {
-                    BlockNumber::Latest | BlockNumber::Pending => current,
+                    BlockNumber::Latest | BlockNumber::Pending => effective_current,
                     BlockNumber::Earliest => U64::ZERO.to::<u64>(),
                     BlockNumber::Number(num) => num,
-                    BlockNumber::Safe => current.saturating_sub(self.slots_in_an_epoch),
-                    BlockNumber::Finalized => current.saturating_sub(self.slots_in_an_epoch * 2),
+                    BlockNumber::Safe => effective_current.saturating_sub(self.slots_in_an_epoch),
+                    BlockNumber::Finalized => effective_current.saturating_sub(self.slots_in_an_epoch * 2),
                 },
             };
 
-        if requested > current {
-            Err(BlockchainError::BlockOutOfRange(current, requested))
+        if requested > effective_current {
+            Err(BlockchainError::BlockOutOfRange(effective_current, requested))
         } else {
             Ok(requested)
         }

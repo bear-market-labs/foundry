@@ -1546,11 +1546,17 @@ impl Backend {
                 env.evm_env.cfg_env.disable_base_fee = true;
             }
 
-            // Update block number and timestamp for this execution
+            // Update block number for this execution
             env.evm_env.block_env.number = U256::from(block_number);
-            env.evm_env.block_env.timestamp = U256::from(self.time.current_call_timestamp());
 
             let mut db = self.db.write().await;
+
+            // Set the timestamp just before execution.
+            // Use next_virtual_timestamp() instead of next_timestamp() because we don't want to
+            // update last_timestamp until the block is actually finalized (via evm_mine).
+            // This allows each virtual block to have its own timestamp without affecting
+            // subsequent transactions.
+            env.evm_env.block_env.timestamp = U256::from(self.time.next_virtual_timestamp());
 
             let executor = TransactionExecutor {
                 db: &mut **db,
@@ -1611,18 +1617,9 @@ impl Backend {
 
                 // Store a virtual block with just this transaction so receipt lookup works
                 if let Some(tx) = executed_tx.block.block.body.transactions.first() {
-                    // Try to get current block from storage first, then from env
-                    let current_block = storage.blocks.get(&best_hash).cloned();
-                    let mut virtual_header = if let Some(current_block) = current_block {
-                        // Use the current block's header as a template
-                        let mut header = current_block.header.clone();
-                        header.transactions_root = executed_tx.block.block.header.transactions_root;
-                        header
-                    } else {
-                        // In fork mode, the current block might not be in storage
-                        // Use the header from the executed transaction's block
-                        executed_tx.block.block.header.clone()
-                    };
+                    // Use the header from the executed transaction's block
+                    // This ensures the timestamp and other execution-specific fields are preserved
+                    let mut virtual_header = executed_tx.block.block.header.clone();
 
                     // Update the block number to match the execution block number
                     virtual_header.number = block_number;
@@ -1659,6 +1656,7 @@ impl Backend {
             let mut all_tx_hashes = Vec::new();
             let mut block_number = 0u64;
             let mut base_header = None;
+            let mut max_timestamp = 0u64;
 
             for virtual_block_hash in &virtual_block_hashes {
                 let virtual_block = storage.blocks.get(virtual_block_hash).cloned()
@@ -1670,6 +1668,9 @@ impl Backend {
                     block_number = virtual_block.header.number;
                 }
 
+                // Track the maximum timestamp from all virtual blocks
+                max_timestamp = max_timestamp.max(virtual_block.header.timestamp);
+
                 // Collect all transactions
                 for tx in &virtual_block.body.transactions {
                     all_transactions.push(tx.clone());
@@ -1680,9 +1681,18 @@ impl Backend {
             let tx_count = all_transactions.len();
             let mut new_header = base_header.expect("Should have at least one virtual block");
 
-            // Use next_timestamp() to get the timestamp for the finalized block
-            // This consumes evm_setNextBlockTimestamp and applies evm_increaseTime offsets
-            new_header.timestamp = self.time.next_timestamp();
+            // Check if evm_setNextBlockTimestamp was called
+            // If so, use that timestamp instead of the max timestamp from virtual blocks
+            let final_timestamp = if let Some(next_exact) = self.time.peek_next_exact_timestamp() {
+                // Clear the next_exact_timestamp since we're consuming it
+                self.time.clear_next_exact_timestamp();
+                next_exact
+            } else {
+                // Use the maximum timestamp from all virtual blocks
+                max_timestamp
+            };
+
+            new_header.timestamp = final_timestamp;
 
             // Create the finalized block with all transactions
             let new_block = create_block(new_header.clone(), all_transactions.clone());
@@ -1730,8 +1740,10 @@ impl Backend {
             env.evm_env.block_env.number = U256::from(header.number);
         }
 
-        // Note: last_timestamp was already updated by next_timestamp() call above
-        // No need to call set_last_timestamp() here
+        // Update last_timestamp to the finalized block's timestamp
+        // This is important because we used next_virtual_timestamp() which doesn't update last_timestamp
+        // Now that the block is finalized, we need to update it so future blocks use the correct base
+        self.time.set_last_timestamp(header.timestamp);
 
         // Update fees for next block
         let next_block_base_fee = self.fees.get_next_block_base_fee_per_gas(

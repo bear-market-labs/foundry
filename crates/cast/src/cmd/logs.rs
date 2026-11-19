@@ -172,6 +172,7 @@ async fn stream_logs<H: BlockHeader>(
                     }
                     first = false;
                     write!(output, "{}", serde_json::to_string(&log).unwrap())?;
+                    output.flush()?;
                 } else {
                     let (formatted, decode_failed) = format_log(&log, event);
                     if decode_failed && !warned_decode_failure {
